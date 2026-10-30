@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudSnap — Secure Cloud Photo Gallery
+  Infrastructure: Cognito, S3, DynamoDB, Lambda, API Gateway, CloudFront
+
+# ─── Parameters ──────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  FrontendOrigin:
+    Type: String
+    Default: 'http://localhost:3000'
+    Description: Allowed CORS origin for the frontend
+
+  MaxFileSizeBytes:
+    Type: Number
+    Default: 52428800  # 50 MB
+    Description: Maximum upload file size in bytes
+
+# ─── Globals ─────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        NODE_ENV: !Ref Environment
+        ORIGINALS_BUCKET: !Ref OriginalsPhotoBucket
+        THUMBS_BUCKET: !Ref ThumbsPhotoBucket
+        PHOTOS_TABLE: !Ref PhotosTable
+        COLLECTIONS_TABLE: !Ref CollectionsTable
+        CLOUDFRONT_DOMAIN: !GetAtt ThumbnailsDistribution.DomainName
+        MAX_FILE_SIZE_BYTES: !Ref MaxFileSizeBytes
+        FRONTEND_ORIGIN: !Ref FrontendOrigin
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: INFO
+      SystemLogLevel: WARN
+
+# ─── Resources ───────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Cognito User Pool ───────────────────────────────────────────────────────
+  CloudSnapUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'cloudsnap-users-${Environment}'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: 'OFF'
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireUppercase: true
+        RequireLowercase: true
+        RequireNumbers: true
+        RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolTags:
+        Project: CloudSnap
+        Environment: !Ref Environment
+      DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+
+  CloudSnapUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'cloudsnap-web-${Environment}'
+      UserPoolId: !Ref CloudSnapUserPool
+      GenerateSecret: false  # Public client — no secret in browser code
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1      # hours
+      IdTokenValidity: 1          # hours
+      RefreshTokenValidity: 30    # days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ── S3 Originals Bucket ─────────────────────────────────────────────────────
+  OriginalsPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudsnap-originals-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref FrontendOrigin
+            AllowedMethods: [PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 300
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'originals/'
+            Function: !GetAtt ProcessThumbnailFunction.Arn
+      Tags:
+        - Key: Project
+          Value: CloudSnap
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Deny insecure transport on originals bucket
+  OriginalsPhotoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OriginalsPhotoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt OriginalsPhotoBucket.Arn
+              - !Sub '${OriginalsPhotoBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ── S3 Thumbnails Bucket ────────────────────────────────────────────────────
+  ThumbsPhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudsnap-thumbs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: CloudSnap
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Allow CloudFront OAC to read thumbnails (no direct public access)
+  ThumbsPhotoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ThumbsPhotoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${ThumbsPhotoBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${ThumbnailsDistribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ThumbsPhotoBucket.Arn
+              - !Sub '${ThumbsPhotoBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ── DynamoDB Tables ─────────────────────────────────────────────────────────
+  PhotosTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub 'CloudSnapPhotos-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: CloudSnap
+
+  CollectionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub 'CloudSnapCollections-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: CloudSnap
+
+  # ── CloudFront Distribution ──────────────────────────────────────────────────
+  ThumbnailsOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'cloudsnap-thumbs-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ThumbnailsDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'CloudSnap thumbnails CDN - ${Environment}'
+        DefaultCacheBehavior:
+          TargetOriginId: ThumbsS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+        Origins:
+          - Id: ThumbsS3Origin
+            DomainName: !GetAtt ThumbsPhotoBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt ThumbnailsOriginAccessControl.Id
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: CloudSnap
+
+  # ── API Gateway ──────────────────────────────────────────────────────────────
+  CloudSnapApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: '$request.header.Authorization'
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CloudSnapUserPool}'
+              audience:
+                - !Ref CloudSnapUserPoolClient
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - DELETE
+          - OPTIONS
+        MaxAge: 300
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # ── Lambda Functions ─────────────────────────────────────────────────────────
+
+  CreateUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-createUploadUrl-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: createUploadUrl.handler
+      Description: Generate S3 pre-signed upload URL and create pending photo record
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref OriginalsPhotoBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${OriginalsPhotoBucket.Arn}/originals/*'
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/upload-url
+            Method: POST
+
+  ConfirmUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-confirmUpload-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: confirmUpload.handler
+      Description: Verify uploaded object and confirm upload metadata
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref OriginalsPhotoBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/{photoId}/confirm
+            Method: POST
+
+  ListPhotosFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-listPhotos-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: listPhotos.handler
+      Description: List authenticated user's photos with pagination and filtering
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos
+            Method: GET
+
+  GetPhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-getPhoto-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: getPhoto.handler
+      Description: Get a single photo by ID (ownership verified)
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/{photoId}
+            Method: GET
+
+  CreateDownloadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-createDownloadUrl-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: createDownloadUrl.handler
+      Description: Generate pre-signed GET URL for downloading original photo
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref PhotosTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${OriginalsPhotoBucket.Arn}/originals/*'
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/{photoId}/download-url
+            Method: POST
+
+  DeletePhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-deletePhoto-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: deletePhoto.handler
+      Description: Delete photo originals, thumbnails, and metadata (ownership verified)
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub '${OriginalsPhotoBucket.Arn}/originals/*'
+                - !Sub '${ThumbsPhotoBucket.Arn}/thumbnails/*'
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/{photoId}
+            Method: DELETE
+
+  UpdatePhotoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-updatePhoto-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: updatePhoto.handler
+      Description: Update photo metadata (displayName, favorite, collectionIds)
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PhotosTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /photos/{photoId}
+            Method: PATCH
+
+  CreateCollectionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-createCollection-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: collections.createCollection
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CollectionsTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /collections
+            Method: POST
+
+  ListCollectionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-listCollections-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: collections.getCollections
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CollectionsTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /collections
+            Method: GET
+
+  UpdateCollectionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-updateCollection-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: collections.updateCollection
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CollectionsTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /collections/{collectionId}
+            Method: PATCH
+
+  DeleteCollectionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-deleteCollection-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: collections.deleteCollection
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CollectionsTable
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudSnapApi
+            Path: /collections/{collectionId}
+            Method: DELETE
+
+  ProcessThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'cloudsnap-processThumbnail-${Environment}'
+      CodeUri: ../backend/dist/handlers/
+      Handler: processThumbnail.handler
+      Description: S3-triggered thumbnail generation using Sharp
+      MemorySize: 1024        # Sharp needs more memory for image processing
+      Timeout: 120
+      EphemeralStorage:
+        Size: 1024            # MB — for temporary image buffers
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${OriginalsPhotoBucket.Arn}/originals/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ThumbsPhotoBucket.Arn}/thumbnails/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt PhotosTable.Arn
+
+  # Allow S3 to invoke the thumbnail Lambda
+  ProcessThumbnailS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ProcessThumbnailFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt OriginalsPhotoBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+# ─── Conditions ───────────────────────────────────────────────────────────────
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ─── Outputs ─────────────────────────────────────────────────────────────────
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CloudSnapUserPool
+    Export:
+      Name: !Sub 'CloudSnap-UserPoolId-${Environment}'
+
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CloudSnapUserPoolClient
+    Export:
+      Name: !Sub 'CloudSnap-ClientId-${Environment}'
+
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${CloudSnapApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub 'CloudSnap-ApiUrl-${Environment}'
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain for thumbnails
+    Value: !GetAtt ThumbnailsDistribution.DomainName
+    Export:
+      Name: !Sub 'CloudSnap-CloudFrontDomain-${Environment}'
+
+  OriginalsPhotoBucketName:
+    Description: S3 originals bucket name
+    Value: !Ref OriginalsPhotoBucket
+
+  ThumbsPhotoBucketName:
+    Description: S3 thumbnails bucket name
+    Value: !Ref ThumbsPhotoBucket
+
+  PhotosTableName:
+    Description: DynamoDB photos table name
+    Value: !Ref PhotosTable
+
+  CollectionsTableName:
+    Description: DynamoDB collections table name
+    Value: !Ref CollectionsTable
+
+  Region:
+    Description: Deployment region
+    Value: !Ref AWS::Region
